@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { ResponseDisplay } from '@/components/rover/ResponseDisplay';
 import { QueryInput } from '@/components/rover/QueryInput';
@@ -29,6 +29,28 @@ export default function RoverPage() {
     ? (isDeepResearch ? 'deep_research' : 'research')
     : 'task';
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  const handleStop = async () => {
+    try {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+      await fetch('http://localhost:8000/stop', {
+        method: 'POST',
+      });
+      setIsLoading(false);
+      setMessages(prev => [...prev, {
+        type: 'thought',
+        content: 'Model execution stopped by user.'
+      }]);
+    } catch (err) {
+      console.error('Failed to stop query:', err);
+      setIsLoading(false);
+    }
+  };
+
   const handleDisconnect = async () => {
     try {
       const response = await fetch('http://localhost:8000/cleanup', {
@@ -54,18 +76,18 @@ export default function RoverPage() {
     const decoder = new TextDecoder();
     let buffer = '';
 
-    const processSSEMessage = (message: string) => {
+    const processSSEMessage = (jsonStr: string) => {
       try {
-        const jsonStr = message.replace(/^data: /, '').trim();
         const data = JSON.parse(jsonStr);
         
-        if (data.type === 'keepalive') return;
+        if (data.type === 'keepalive' || data.type === 'complete' || data.type === 'end') return;
         
         // Clean content if it matches the pattern
-        const cleanContent = (content: any) => {
-          // If content is already an array, return it directly
+        const cleanContent = (content: unknown): string => {
+          if (content === null || content === undefined) return '';
+          // If content is already an array, join into string
           if (Array.isArray(content)) {
-            return content;
+            return content.map(item => typeof item === 'object' ? JSON.stringify(item) : String(item)).join('\n');
           }
           
           if (typeof content === 'string') {
@@ -73,7 +95,7 @@ export default function RoverPage() {
               // Try to parse as JSON
               const parsed = JSON.parse(content);
               if (Array.isArray(parsed)) {
-                return parsed;
+                return parsed.map(item => typeof item === 'object' ? JSON.stringify(item) : String(item)).join('\n');
               }
               // If it's a string with ["..."] pattern
               if (content.startsWith('["') && content.endsWith('"]')) {
@@ -85,11 +107,12 @@ export default function RoverPage() {
                 return content.slice(2, -2);
               }
             }
+            return content;
           }
-          return content;
+          return typeof content === 'object' ? JSON.stringify(content) : String(content);
         };
 
-        const processedData = {
+        const processedData: Message = {
           type: data.type,
           content: cleanContent(data.content)
         };
@@ -103,35 +126,20 @@ export default function RoverPage() {
           case 'final_response':
           case 'dom_update':
           case 'interaction':
-            setMessages(prev => [...prev, processedData]);
-            break;
-          
-          // Research specific events
+          case 'error':
           case 'rag_action':
           case 'review':
           case 'close_tab':
           case 'cleanup':
-            if (isResearchMode) {
-              setMessages(prev => [...prev, processedData]);
-            }
-            break;
-          
-          // Deep research specific events
           case 'subtopics':
           case 'subtopic_answer':
           case 'subtopic_status':
           case 'compile':
-            if (isResearchMode && isDeepResearch) {
-              setMessages(prev => [...prev, processedData]);
-            }
-            break;
-          
-          case 'error':
             setMessages(prev => [...prev, processedData]);
             break;
         }
       } catch (e) {
-        console.error('Failed to parse SSE message:', message, e);
+        console.error('Failed to parse SSE message:', jsonStr, e);
       }
     };
 
@@ -141,13 +149,38 @@ export default function RoverPage() {
 
       buffer += decoder.decode(value, { stream: true });
       
-      // Find complete SSE messages
-      const messages = buffer.match(/data: {[\s\S]*?}\n\n/g);
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop() || '';
       
-      if (messages) {
-        messages.forEach(processSSEMessage);
-        // Remove processed messages from buffer
-        buffer = buffer.slice(buffer.lastIndexOf('}') + 1);
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (!trimmed) continue;
+        
+        let jsonStr = '';
+        if (trimmed.startsWith('data:')) {
+          const lines = trimmed.split(/\r?\n/);
+          jsonStr = lines.map(line => line.replace(/^data:\s*/, '')).join('\n').trim();
+        } else {
+          jsonStr = trimmed;
+        }
+        
+        if (jsonStr) {
+          processSSEMessage(jsonStr);
+        }
+      }
+    }
+
+    if (buffer.trim()) {
+      const trimmed = buffer.trim();
+      let jsonStr = '';
+      if (trimmed.startsWith('data:')) {
+        const lines = trimmed.split(/\r?\n/);
+        jsonStr = lines.map(line => line.replace(/^data:\s*/, '')).join('\n').trim();
+      } else {
+        jsonStr = trimmed;
+      }
+      if (jsonStr) {
+        processSSEMessage(jsonStr);
       }
     }
   };
@@ -164,6 +197,9 @@ export default function RoverPage() {
     const currentQuery = query;
     setQuery(''); // Clear input after sending
 
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     try {
       const response = await fetch('http://localhost:8000/query', {
         method: 'POST',
@@ -172,6 +208,7 @@ export default function RoverPage() {
           query: currentQuery,
           agent_type: currentAgent 
         }),
+        signal: abortController.signal
       });
 
       if (!response.ok) {
@@ -180,14 +217,19 @@ export default function RoverPage() {
       }
 
       await handleStreamingResponse(response);
-    } catch (error: any) {
+    } catch (error: unknown) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return;
+      }
       console.error('Query failed:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to process query. Please try again.';
       setMessages(prev => [...prev, { 
         type: 'error', 
-        content: error?.message || 'Failed to process query. Please try again.' 
+        content: errorMessage 
       }]);
     } finally {
       setIsLoading(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -253,6 +295,7 @@ export default function RoverPage() {
           value={query}
           onChange={setQuery}
           onSubmit={handleSubmit}
+          onStop={handleStop}
           isLoading={isLoading}
         />
       </div>

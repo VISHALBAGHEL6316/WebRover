@@ -20,8 +20,6 @@ from playwright.async_api import async_playwright
 
 app = FastAPI()
 
-app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # Your Next.js app URL
@@ -35,6 +33,9 @@ browser_session = {
     "browser": None,
     "page": None
 }
+
+# Global event for stopping current model execution
+stop_event = asyncio.Event()
 
 # Global queue for browser events
 browser_events = asyncio.Queue()
@@ -88,6 +89,12 @@ async def cleanup_browser():
         print(f"Cleanup error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to cleanup browser: {str(e)}")
 
+@app.post("/stop")
+async def stop_execution():
+    print("Stop requested by user, signalling stop_event...")
+    stop_event.set()
+    return {"status": "success", "message": "Model execution stopped"}
+
 async def emit_browser_event(event_type: str, data: Dict[str, Any]):
     await browser_events.put({
         "type": event_type,
@@ -113,6 +120,18 @@ async def browser_events_endpoint():
         }
     )
 
+def sse_event(event_type: str, content: Any = None, **kwargs) -> str:
+    payload: Dict[str, Any] = {"type": event_type}
+    if content is not None:
+        payload["content"] = content
+    payload.update(kwargs)
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+def get_field(obj: Any, field_name: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(field_name, default)
+    return getattr(obj, field_name, default)
+
 async def stream_task_agent_response(query: str, page, agent_graph):
     try:
         initial_state = {
@@ -131,70 +150,63 @@ async def stream_task_agent_response(query: str, page, agent_graph):
             initial_state,
             {"recursion_limit": 400}
         ):
+            if stop_event.is_set():
+                print("Stop requested, terminating task agent...")
+                yield sse_event("thought", "Model execution stopped by user.")
+                yield sse_event("final_response", "Model execution stopped by user.")
+                break
             try:
-                # Send keepalive more frequently
-                yield f"data: {{\n  \"type\": \"keepalive\",\n  \"timestamp\": {time.time()}\n}}\n\n"
-                await asyncio.sleep(0.1)  # Small delay to prevent overwhelming
+                yield sse_event("keepalive", timestamp=time.time())
+                await asyncio.sleep(0.1)
                 
                 if isinstance(event, dict):
                     if "decide_immediate_action" in event:
-                        thought = event["decide_immediate_action"]["decide_action"]["thought"]
-                        thought_json = json.dumps(thought, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"thought\",\n  \"content\": {thought_json}\n}}\n\n"
+                        decide_action = event["decide_immediate_action"].get("decide_action")
+                        thought = get_field(decide_action, "thought")
+                        if thought:
+                            yield sse_event("thought", thought)
                     
                     if "decide_url" in event:
-                        action = event["decide_url"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"action\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["decide_url"].get("actions_taken")
+                        yield sse_event("action", action)
                     
-                    # Stream DOM updates
-                    if any(key in event for key in ["get_all_elements", "get_all_input_elements", 
-                                                  "get_all_button_elements", "get_all_link_elements"]):
-                        action = event[list(event.keys())[0]]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"dom_update\",\n  \"content\": {action_json}\n}}\n\n"
+                    dom_keys = ["get_all_elements", "get_all_input_elements", "get_all_button_elements", "get_all_link_elements"]
+                    matching_dom_key = next((k for k in dom_keys if k in event), None)
+                    if matching_dom_key:
+                        action = event[matching_dom_key].get("actions_taken")
+                        yield sse_event("dom_update", action)
                     
-                    # Stream interactions
-                    if any(key in event for key in ["interact_with_input_elements", 
-                                                  "interact_with_button_elements",
-                                                  "interact_with_link_elements"]):
-                        actions = event[list(event.keys())[0]]["actions"]["element_actions"]
-                        actions_json = json.dumps(actions, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"interaction\",\n  \"content\": {actions_json}\n}}\n\n"
+                    interact_keys = ["interact_with_input_elements", "interact_with_button_elements", "interact_with_link_elements"]
+                    matching_interact_key = next((k for k in interact_keys if k in event), None)
+                    if matching_interact_key:
+                        actions_obj = event[matching_interact_key].get("actions")
+                        actions = get_field(actions_obj, "element_actions")
+                        yield sse_event("interaction", actions)
                     
-                    # Stream browser actions
-                    if any(key in event for key in ["click", "type", "wait", "go_back", "go_to_search"]):
-                        actions = event[list(event.keys())[0]]["actions_taken"]
-                        actions_json = json.dumps(actions, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"browser_action\",\n  \"content\": {actions_json}\n}}\n\n"
+                    action_keys = ["click", "type", "wait", "go_back", "go_to_search"]
+                    matching_action_key = next((k for k in action_keys if k in event), None)
+                    if matching_action_key:
+                        actions = event[matching_action_key].get("actions_taken")
+                        yield sse_event("browser_action", actions)
                     
                     if "respond" in event:
-                        response = event["respond"]["response"]
-                        response_json = json.dumps(response, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"final_response\",\n  \"content\": {response_json}\n}}\n\n"
+                        response = event["respond"].get("response")
+                        yield sse_event("final_response", response)
                         
-                    # After each event, send another keepalive
-                    yield f"data: {{\n  \"type\": \"keepalive\",\n  \"timestamp\": {time.time()}\n}}\n\n"
+                    yield sse_event("keepalive", timestamp=time.time())
                         
             except Exception as e:
-                error_json = json.dumps(str(e), ensure_ascii=False)
-                yield f"data: {{\n  \"type\": \"error\",\n  \"content\": {error_json}\n}}\n\n"
-                continue  # Continue processing even if one event fails
+                yield sse_event("error", str(e))
+                continue
                 
     except Exception as e:
-        error_json = json.dumps(str(e), ensure_ascii=False)
-        yield f"data: {{\n  \"type\": \"error\",\n  \"content\": {error_json}\n}}\n\n"
+        yield sse_event("error", str(e))
     finally:
-        # Ensure we have a small delay before ending
         await asyncio.sleep(0.5)
-        # Send final keepalive
-        yield f"data: {{\n  \"type\": \"keepalive\",\n  \"timestamp\": {time.time()}\n}}\n\n"
-        # Send completion signal
-        yield f"data: {{\n  \"type\": \"complete\",\n  \"content\": \"Processing completed\"\n}}\n\n"
-        # Small delay before final end message
+        yield sse_event("keepalive", timestamp=time.time())
+        yield sse_event("complete", "Processing completed")
         await asyncio.sleep(0.5)
-        # Send end message
-        yield f"data: {{\n  \"type\": \"end\",\n  \"content\": \"Stream completed\"\n}}\n\n"
+        yield sse_event("end", "Stream completed")
 
 async def stream_research_agent_response(query: str, page, agent_graph):
     try:
@@ -215,76 +227,66 @@ async def stream_research_agent_response(query: str, page, agent_graph):
             initial_state,
             {"recursion_limit": 400}
         ):
+            if stop_event.is_set():
+                print("Stop requested, terminating task agent...")
+                yield sse_event("thought", "Model execution stopped by user.")
+                yield sse_event("final_response", "Model execution stopped by user.")
+                break
             try:
-                # Send keepalive more frequently
-                yield f"data: {{\n  \"type\": \"keepalive\",\n  \"timestamp\": {time.time()}\n}}\n\n"
+                yield sse_event("keepalive", timestamp=time.time())
                 
                 if isinstance(event, dict):
-                    # Handle LLM thoughts
                     if "llm_call_node" in event:
-                        thought = event["llm_call_node"]["action"]["thought"]
-                        thought_json = json.dumps(thought, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"thought\",\n  \"content\": {thought_json}\n}}\n\n"
+                        action_data = event["llm_call_node"].get("action")
+                        thought = get_field(action_data, "thought")
+                        if thought:
+                            yield sse_event("thought", thought)
                     
-                    # Handle browser actions
-                    if any(key in event for key in ["click", "type", "wait", "go_back", "go_to_search"]):
-                        actions = event[list(event.keys())[0]]["actions_taken"]
-                        actions_json = json.dumps(actions, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"action\",\n  \"content\": {actions_json}\n}}\n\n"
+                    action_keys = ["click", "type", "wait", "go_back", "go_to_search"]
+                    matching_action_key = next((k for k in action_keys if k in event), None)
+                    if matching_action_key:
+                        actions = event[matching_action_key].get("actions_taken")
+                        yield sse_event("action", actions)
                     
-                    # Handle RAG operations
                     if "web_page_rag" in event:
-                        action = event["web_page_rag"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"rag_action\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["web_page_rag"].get("actions_taken")
+                        yield sse_event("rag_action", action)
                     
-                    # Handle self review
                     if "self_review" in event:
-                        action = event["self_review"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"review\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["self_review"].get("actions_taken")
+                        yield sse_event("review", action)
                     
-                    # Handle closing tabs
                     if "close_opened_link" in event:
-                        action = event["close_opened_link"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"close_tab\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["close_opened_link"].get("actions_taken")
+                        yield sse_event("close_tab", action)
                     
-                    # Handle final answer
                     if "answer_node" in event:
-                        action = event["answer_node"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"action\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["answer_node"].get("actions_taken")
+                        yield sse_event("action", action)
                         
-                        answer = event["answer_node"]["answer"]
-                        answer_json = json.dumps(answer, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"final_answer\",\n  \"content\": {answer_json}\n}}\n\n"
+                        answer = event["answer_node"].get("answer")
+                        yield sse_event("final_answer", answer)
                         
-                        conversation_history = event["answer_node"]["conversation_history"]
-                        history_json = json.dumps(conversation_history, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"conversation_history\",\n  \"content\": {history_json}\n}}\n\n"
+                        conversation_history = event["answer_node"].get("conversation_history")
+                        yield sse_event("conversation_history", conversation_history)
                     
-                    # Handle RAG store cleanup
                     if "empty_rag_store" in event:
-                        action = event["empty_rag_store"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"cleanup\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["empty_rag_store"].get("actions_taken")
+                        yield sse_event("cleanup", action)
                         
-                await asyncio.sleep(0.1)  # Small delay between events
+                await asyncio.sleep(0.1)
                         
             except Exception as e:
-                error_json = json.dumps(str(e), ensure_ascii=False)
-                yield f"data: {{\n  \"type\": \"error\",\n  \"content\": {error_json}\n}}\n\n"
+                yield sse_event("error", str(e))
                 continue
                 
     except Exception as e:
-        error_json = json.dumps(str(e), ensure_ascii=False)
-        yield f"data: {{\n  \"type\": \"error\",\n  \"content\": {error_json}\n}}\n\n"
+        yield sse_event("error", str(e))
     finally:
         await asyncio.sleep(0.5)
-        yield f"data: {{\n  \"type\": \"complete\",\n  \"content\": \"Processing completed\"\n}}\n\n"
+        yield sse_event("complete", "Processing completed")
         await asyncio.sleep(0.5)
-        yield f"data: {{\n  \"type\": \"end\",\n  \"content\": \"Stream completed\"\n}}\n\n"
+        yield sse_event("end", "Stream completed")
 
 async def stream_deep_research_agent_response(query: str, page, agent_graph):
     try:
@@ -311,100 +313,95 @@ async def stream_deep_research_agent_response(query: str, page, agent_graph):
             initial_state,
             {"recursion_limit": 400}
         ):
+            if stop_event.is_set():
+                print("Stop requested, terminating task agent...")
+                yield sse_event("thought", "Model execution stopped by user.")
+                yield sse_event("final_response", "Model execution stopped by user.")
+                break
             try:
-                # Send keepalive more frequently
-                yield f"data: {{\n  \"type\": \"keepalive\",\n  \"timestamp\": {time.time()}\n}}\n\n"
+                yield sse_event("keepalive", timestamp=time.time())
                 
                 if isinstance(event, dict):
-                    # Handle topic breakdown
                     if "topic_breakdown" in event:
-                        subtopics = event["topic_breakdown"]["subtopics"]
-                        subtopics_json = json.dumps(subtopics, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"subtopics\",\n  \"content\": {subtopics_json}\n}}\n\n"
+                        subtopics = event["topic_breakdown"].get("subtopics", [])
+                        yield sse_event("subtopics", subtopics)
                     
-                    # Handle LLM thoughts
                     if "llm_call_node" in event:
-                        thought = event["llm_call_node"]["action"]["thought"]
-                        thought_json = json.dumps(thought, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"thought\",\n  \"content\": {thought_json}\n}}\n\n"
+                        action_data = event["llm_call_node"].get("action")
+                        thought = get_field(action_data, "thought")
+                        if thought:
+                            yield sse_event("thought", thought)
                     
-                    # Handle browser actions
-                    if any(key in event for key in ["click", "type", "wait", "go_back", "go_to_search"]):
-                        action = event[list(event.keys())[0]]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"browser_action\",\n  \"content\": {action_json}\n}}\n\n"
+                    action_keys = ["click", "type", "wait", "go_back", "go_to_search"]
+                    matching_action_key = next((k for k in action_keys if k in event), None)
+                    if matching_action_key:
+                        action = event[matching_action_key].get("actions_taken")
+                        yield sse_event("browser_action", action)
                     
-                    # Handle RAG operations
                     if "web_page_rag" in event:
-                        action = event["web_page_rag"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"rag_action\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["web_page_rag"].get("actions_taken")
+                        yield sse_event("rag_action", action)
                     
-                    # Handle self review
                     if "self_review" in event:
-                        action = event["self_review"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"review\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["self_review"].get("actions_taken")
+                        yield sse_event("review", action)
                     
-                    # Handle subtopic answers
                     if "subtopic_answer_node" in event:
-                        action = event["subtopic_answer_node"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"subtopic_answer\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["subtopic_answer_node"].get("actions_taken")
+                        yield sse_event("subtopic_answer", action)
                         
-                        subtopic_status = event["subtopic_answer_node"]["subtopic_status"]
-                        status_json = json.dumps(subtopic_status, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"subtopic_status\",\n  \"content\": {status_json}\n}}\n\n"
+                        subtopic_status = event["subtopic_answer_node"].get("subtopic_status")
+                        yield sse_event("subtopic_status", subtopic_status)
                     
-                    # Handle closing tabs
                     if "close_opened_link" in event:
-                        action = event["close_opened_link"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"close_tab\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["close_opened_link"].get("actions_taken")
+                        yield sse_event("close_tab", action)
                     
-                    # Handle research compilation
                     if "compile_research" in event:
-                        action = event["compile_research"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"compile\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["compile_research"].get("actions_taken")
+                        yield sse_event("compile", action)
                         
-                        answer = event["compile_research"]["final_answer"]
-                        answer_json = json.dumps(answer, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"final_answer\",\n  \"content\": {answer_json}\n}}\n\n"
+                        answer = event["compile_research"].get("final_answer")
+                        yield sse_event("final_answer", answer)
                         
-                        conversation_history = event["compile_research"]["conversation_history"]
-                        history_json = json.dumps(conversation_history, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"conversation_history\",\n  \"content\": {history_json}\n}}\n\n"
+                        conversation_history = event["compile_research"].get("conversation_history")
+                        yield sse_event("conversation_history", conversation_history)
                     
-                    # Handle RAG store cleanup
                     if "empty_rag_store" in event:
-                        action = event["empty_rag_store"]["actions_taken"]
-                        action_json = json.dumps(action, ensure_ascii=False)
-                        yield f"data: {{\n  \"type\": \"cleanup\",\n  \"content\": {action_json}\n}}\n\n"
+                        action = event["empty_rag_store"].get("actions_taken")
+                        yield sse_event("cleanup", action)
                         
-                await asyncio.sleep(0.1)  # Small delay between events
+                await asyncio.sleep(0.1)
                         
             except Exception as e:
-                error_json = json.dumps(str(e), ensure_ascii=False)
-                yield f"data: {{\n  \"type\": \"error\",\n  \"content\": {error_json}\n}}\n\n"
+                yield sse_event("error", str(e))
                 continue
                 
     except Exception as e:
-        error_json = json.dumps(str(e), ensure_ascii=False)
-        yield f"data: {{\n  \"type\": \"error\",\n  \"content\": {error_json}\n}}\n\n"
+        yield sse_event("error", str(e))
     finally:
         await asyncio.sleep(0.5)
-        yield f"data: {{\n  \"type\": \"complete\",\n  \"content\": \"Processing completed\"\n}}\n\n"
+        yield sse_event("complete", "Processing completed")
         await asyncio.sleep(0.5)
-        yield f"data: {{\n  \"type\": \"end\",\n  \"content\": \"Stream completed\"\n}}\n\n"
+        yield sse_event("end", "Stream completed")
 
 @app.post("/query")
 async def query_agent(request: QueryRequest):
-    if not browser_session["page"]:
-        raise HTTPException(
-            status_code=400, 
-            detail="Browser not initialized. Call /setup-browser first"
-        )
+    stop_event.clear()
+    page = browser_session.get("page")
+    if not page or page.is_closed():
+        try:
+            print("Browser not initialized or closed, auto-setting up browser...")
+            browser, page = await setup_browser("https://www.google.com")
+            browser_session.update({
+                "browser": browser,
+                "page": page
+            })
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Browser not initialized and auto-setup failed: {str(e)}"
+            )
     
     agent_graphs = {
         "task": task_agent,

@@ -16,6 +16,7 @@ venv/
 
 # Project specific
 rag_store_webpage/
+rag_store_webpage_gemini/
 rag_store/
 old_backend/
 

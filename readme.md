@@ -4,7 +4,7 @@
   <!-- Backend -->
   <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" />
   <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" />
-  <img src="https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white" />
+  <img src="https://img.shields.io/badge/Google_Gemini-8E75B2?style=for-the-badge&logo=googlegemini&logoColor=white" />
   <img src="https://img.shields.io/badge/LangChain-121212?style=for-the-badge&logo=chainlink&logoColor=white" />
   <img src="https://img.shields.io/badge/LangGraph-FF6B6B?style=for-the-badge&logo=graph&logoColor=white" />
   <img src="https://img.shields.io/badge/Playwright-2EAD33?style=for-the-badge&logo=playwright&logoColor=white" />
@@ -74,7 +74,7 @@ https://github.com/user-attachments/assets/95ae9afb-3fdf-47f8-857e-f6a1a0d94df5
 - Reference management
 
 ### Technical Features
-- State-of-the-art LLM integration (GPT-4o, o3-mini-high, Claude-3.5 sonnet)
+- Gemini-powered agent reasoning, structured outputs, and embeddings
 - RAG pipeline for enhanced responses
 - LangGraph for state management
 - Playwright for reliable web automation
@@ -141,7 +141,7 @@ The system is built on a modern tech stack with three distinct agent types, each
    - Automatic content structuring and organization
 
 4. **AI Decision Making**
-   - Multiple LLM integration (GPT-4, Claude)
+   - Gemini models for agent reasoning and structured outputs
    - Context-aware navigation
    - Self-review mechanisms
    - Structured output generation
@@ -192,15 +192,16 @@ The system is built on a modern tech stack with three distinct agent types, each
    poetry install
    ```
 
-6. Set up environment variables in `.env`:
+6. Create `.env` in the `backend/` directory and add your Google AI Studio API key:
    ```bash
-   OPENAI_API_KEY="your_openai_api_key"
-   LANGCHAIN_API_KEY="your_langchain_api_key"
-   LANGCHAIN_TRACING_V2="true"
-   LANGCHAIN_ENDPOINT="https://api.smith.langchain.com"
-   LANGCHAIN_PROJECT="your_project_name"
-   ANTHROPIC_API_KEY="your_anthropic_api_key"
+   GOOGLE_API_KEY="your_google_ai_studio_api_key"
+   GEMINI_MODEL="gemini-3.5-flash-lite"
+   GEMINI_FAST_MODEL="gemini-3.5-flash-lite"
+   GEMINI_REASONING_MODEL="gemini-3-flash-preview"
+   TAVILY_API_KEY="your_tavily_api_key"
    ```
+
+   The Gemini model names are optional; the defaults above are used when omitted. LangSmith tracing is also optional and can be enabled with `LANGCHAIN_API_KEY`, `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_ENDPOINT=https://api.smith.langchain.com`, and `LANGCHAIN_PROJECT`.
 
 7. Run the backend:
 

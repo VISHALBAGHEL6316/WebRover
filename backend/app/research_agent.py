@@ -1,7 +1,4 @@
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
-import os
+from .models import embeddings, llm, llm_fast, llm_reasoning
 from typing import TypedDict, Annotated, List, Literal
 from playwright.async_api import Page
 from operator import add
@@ -11,7 +8,16 @@ import asyncio
 from playwright.async_api import async_playwright
 from playwright.async_api import Page, Locator
 import platform
-from langchain_text_splitters import NLTKTextSplitter, SpacyTextSplitter
+import urllib.parse
+from pathlib import Path
+
+def load_marking_script(filename: str) -> str:
+    path = Path("marking_scripts") / filename
+    if not path.exists():
+        path = Path(__file__).resolve().parent.parent / "marking_scripts" / filename
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+from langchain_text_splitters import NLTKTextSplitter, SpacyTextSplitter, RecursiveCharacterTextSplitter
 from newspaper import Article
 import aiohttp
 import asyncio
@@ -19,41 +25,16 @@ from io import BytesIO
 from PyPDF2 import PdfReader
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import OpenAIEmbeddings
 from langgraph.graph import START, END, StateGraph
 from IPython.display import Image, display
 import nltk
 
 
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
-load_dotenv()
-def set_env_vars(var):
-    value = os.getenv(var)
-    if value is not None:
-        os.environ[var] = value
-
-
-vars = ["OPENAI_API_KEY", "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LANGCHAIN_ENDPOINT", "LANGCHAIN_PROJECT", "TAVILY_API_KEY", "ANTHROPIC_API_KEY"]
-
-for var in vars:
-    set_env_vars(var)
-
-llm_4o = ChatOpenAI(model="gpt-4o", temperature=0)
-llm_mini = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-llm_o3_mini = ChatOpenAI(model="o3-mini", reasoning_effort="high")
-
-llm_anthropic = ChatAnthropic(model="claude-3-5-sonnet-20240620", temperature=0)
-llm_openai_o1 = ChatOpenAI(model="o1-preview", temperature=1)
-llm = llm_4o
-
-
 class Url(BaseModel):
-    url: str | Literal["NO_CHANGE"] = Field(description="The url to navigate to")
+    url: str | Literal["NO_CHANGE"] = Field(default="NO_CHANGE", description="The url to navigate to")
 
 class SelfReview(BaseModel):
     answer: Literal["Yes", "No"]
@@ -115,8 +96,7 @@ async def setup_browser(go_to_page: str):
 
 
 # Load the JavaScript file
-with open("marking_scripts/final_marking.js", "r", encoding="utf-8") as f:
-    marking_script = f.read()
+marking_script = load_marking_script("final_marking.js")
 
 async def execute_script(page):
 
@@ -185,154 +165,125 @@ async def remove_highlights(page):
 
 async def click(state: AgentState):
     page = state["page"]
-    element_type = state["action"]["action_element"]["type"]
-    try:    
-        xpath = state["action"]["action_element"]["xpath"]
-    except Exception as e:
-        bbox_x = state["action"]["action_element"]["x"]
-        bbox_y = state["action"]["action_element"]["y"]
+    action_element = state["action"].get("action_element") or {}
+    element_type = action_element.get("type", "")
+    xpath = action_element.get("xpath")
+    bbox_x = action_element.get("x")
+    bbox_y = action_element.get("y")
+    element_desc = action_element.get("description") or action_element.get("text") or "element"
 
-    # Scroll the element into view using its XPath
-    try:
-        await page.evaluate(
-            """
-            (xpath) => {
-                const result = document.evaluate(
-                    xpath, 
-                    document, 
-                    null, 
-                    XPathResult.FIRST_ORDERED_NODE_TYPE, 
-                    null
-                );
-                const element = result.singleNodeValue;
-                if (element) {
-                    element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
-                }
-            }
-            """,
-            xpath
-        )
-    except Exception as e:
-        return {
-            "actions_taken": ["Failed to scroll element into view, retrying..."],
-            "page": state["page"],
-            "new_page": False
-        }
+    initial_page = page
+    new_page_created = False
+    clicked = False
 
-    try:
-        element = page.locator(f'xpath={xpath}')
-        if element_type == "link":
+    # Safely scroll element into view if possible without throwing
+    if xpath:
+        try:
+            await page.locator(f'xpath={xpath}').scroll_into_view_if_needed(timeout=1500)
+        except Exception:
             try:
-                async with page.context.expect_page(timeout=10000) as new_page_info:
-                    if platform.system() == "Darwin":
-                        await element.click(modifiers=["Meta"], timeout=5000)
-                    else:
-                        await element.click(modifiers=["Control"], timeout=5000)
-                    
+                await page.evaluate(
+                    """
+                    (xpath) => {
+                        try {
+                            const result = document.evaluate(
+                                xpath, 
+                                document, 
+                                null, 
+                                XPathResult.FIRST_ORDERED_NODE_TYPE, 
+                                null
+                            );
+                            const element = result.singleNodeValue;
+                            if (element) {
+                                element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+                            }
+                        } catch(e) {}
+                    }
+                    """,
+                    xpath
+                )
+            except Exception:
+                pass
+
+    # 1. If it's a link, resolve its href and open in a new tab
+    if element_type == "link" and xpath:
+        try:
+            loc = page.locator(f'xpath={xpath}')
+            href = await loc.get_attribute("href", timeout=2000)
+            if href:
+                full_url = urllib.parse.urljoin(page.url, href)
+                if full_url.startswith("http"):
+                    try:
+                        new_page = await page.context.new_page()
+                        await new_page.goto(full_url, timeout=30000, wait_until="domcontentloaded")
+                        state["page"] = new_page
+                        new_page_created = True
+                        clicked = True
+                    except Exception as e:
+                        print(f"Error opening new tab for {full_url}: {e}")
+        except Exception:
+            pass
+
+    # 2. Try standard Playwright locator click
+    if not clicked and xpath:
+        try:
+            loc = page.locator(f'xpath={xpath}')
+            if element_type == "link":
                 try:
+                    async with page.context.expect_page(timeout=3000) as new_page_info:
+                        if platform.system() == "Darwin":
+                            await loc.click(modifiers=["Meta"], timeout=2500)
+                        else:
+                            await loc.click(modifiers=["Control"], timeout=2500)
                     new_page = await new_page_info.value
                     if new_page:
                         await new_page.bring_to_front()
                         await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
                         state["page"] = new_page
-                    else:
-                        return {
-                            "actions_taken": ["Link click didn't open new page, retrying..."],
-                            "page": state["page"],
-                            "new_page": False
-                        }
-                except TimeoutError:
-                    return {
-                        "actions_taken": ["Page load timed out, retrying..."],
-                        "page": state["page"],
-                        "new_page": False
-                    }
-            except TimeoutError:
-                # Fallback to coordinate-based clicking if element click times out
-                return {
-                    "actions_taken": ["Element click timed out, retrying with coordinates..."],
-                    "page": state["page"],
-                    "new_page": False
-                }
-        else:
-            await element.click(timeout=5000)
-
-    except Exception as fallback:
-        # Coordinate-based clicking fallback
-        try:
-            bbox_x = state["action"]["action_element"]["x"]
-            bbox_y = state["action"]["action_element"]["y"]
-            
-            if element_type == "link":
-                try:
-                    async with page.context.expect_page(timeout=10000) as new_page_info:
-                        if platform.system() == "Darwin":
-                            await page.keyboard.down("Meta")
-                            await page.mouse.click(bbox_x, bbox_y, click_count=3)
-                            await page.keyboard.up("Meta")
-                        else:
-                            await page.keyboard.down("Control")
-                            await page.mouse.click(bbox_x, bbox_y, click_count=3)
-                            await page.keyboard.up("Control")
-                        
-                        try:
-                            new_page = await new_page_info.value
-                            if new_page:
-                                await new_page.bring_to_front()
-                                await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
-                                state["page"] = new_page
-                            else:
-                                return {
-                                    "actions_taken": ["Coordinate click didn't open new page, retrying..."],
-                                    "page": state["page"],
-                                    "new_page": False
-                                }
-                        except TimeoutError:
-                            return {
-                                "actions_taken": ["Page load timed out after coordinate click, retrying..."],
-                                "page": state["page"],
-                                "new_page": False
-                            }
-                except TimeoutError:
-                    return {
-                        "actions_taken": ["Coordinate click timed out, retrying..."],
-                        "page": state["page"],
-                        "new_page": False
-                    }
+                        new_page_created = True
+                        clicked = True
+                except Exception:
+                    await loc.click(timeout=3000)
+                    clicked = True
             else:
-                await page.mouse.click(bbox_x, bbox_y)
+                await loc.click(timeout=3000)
+                clicked = True
+        except Exception:
+            # Try force click with locator
+            try:
+                await page.locator(f'xpath={xpath}').click(force=True, timeout=2000)
+                clicked = True
+            except Exception:
+                pass
+
+    # 3. Fallback to coordinate-based clicking
+    if not clicked and bbox_x is not None and bbox_y is not None and bbox_x > 0 and bbox_y > 0:
+        try:
+            await page.mouse.click(bbox_x, bbox_y)
+            clicked = True
         except Exception as e:
-            await page.evaluate("""
-                async () => {
-                    const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-                    
-                    // Scroll back to the top after scrolling down
-                    window.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
-                    
-                    // Wait until the scroll position reaches the top
-                    while (window.scrollY > 0) {
-                        await delay(100);
-                    }
-                }
-                """)
-            return {
-                "actions_taken": ["All click attempts failed, retrying..."],
-                "page": state["page"],
-                "new_page": False
-            }
+            print(f"Coordinate click failed: {e}")
 
     await asyncio.sleep(2)
-    
-    element_description = (
-        f"{state['action']['action_element']['type']} element "
-        f"{state['action']['action_element']['description']}"
-    )
-    
-    if state["page"] == page:
-        return {"actions_taken": [f"Clicked {element_description}"], "page": state["page"], "new_page": False}
+
+    if clicked:
+        is_new = new_page_created or (state["page"] != initial_page)
+        return {
+            "actions_taken": [f"Clicked {element_type or 'element'} {element_desc}"],
+            "page": state["page"],
+            "new_page": is_new
+        }
     else:
-        return {"actions_taken": [f"Clicked {element_description}"], "page": state["page"], "new_page": True}
-    
+        try:
+            await page.evaluate("window.scrollBy({ top: 300, behavior: 'smooth' });")
+        except Exception:
+            pass
+        return {
+            "actions_taken": [f"Attempted to click {element_desc}, continuing"],
+            "page": state["page"],
+            "new_page": False
+        }
+
 
 # After Click Router
 
@@ -347,38 +298,45 @@ async def after_click_router(state: AgentState):
 async def type(state: AgentState):
     """Types text into an input field located by its XPath, fallback bounding box if XPath fails."""
     page = state["page"]
-    text = state["action"]["args"]
-    
-    
-        
-    try:
-        bbox_x, bbox_y = state["action"]["action_element"]["x"], state["action"]["action_element"]["y"]
-        await page.mouse.click(bbox_x, bbox_y, click_count=3)
-        await asyncio.sleep(1)
-        select_all = "Meta+A" if platform.system() == "Darwin" else "Control+A"
-        await page.keyboard.press(select_all)
-        await asyncio.sleep(1)
-        await page.keyboard.press("Backspace")
-        await asyncio.sleep(1)
-        await page.keyboard.type(text)
-        await asyncio.sleep(4)
+    text = state["action"].get("args", "")
+    action_element = state["action"].get("action_element") or {}
+    element_description = f"{action_element.get('type', 'input')} element {action_element.get('description', '')}"
 
-    except Exception as e:
-        xpath = state["action"]["action_element"]["xpath"]
-        await page.locator(f'xpath={xpath}').click()
-        await asyncio.sleep(1)
-        select_all = "document.execCommand('selectAll', false, null);"
-        await page.locator(f'xpath={xpath}').evaluate(select_all)
-        await asyncio.sleep(1)
-        await page.locator(f'xpath={xpath}').type(text)
-        await asyncio.sleep(4)
-        
+    typed = False
+    bbox_x = action_element.get("x")
+    bbox_y = action_element.get("y")
+    xpath = action_element.get("xpath")
 
-    element_description = f"{state['action']['action_element']['type']} element {state['action']['action_element']['description']}"
+    if bbox_x is not None and bbox_y is not None and bbox_x > 0 and bbox_y > 0:
+        try:
+            await page.mouse.click(bbox_x, bbox_y, click_count=3)
+            await asyncio.sleep(0.5)
+            select_all = "Meta+A" if platform.system() == "Darwin" else "Control+A"
+            await page.keyboard.press(select_all)
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(text)
+            typed = True
+        except Exception:
+            pass
+
+    if not typed and xpath:
+        try:
+            loc = page.locator(f'xpath={xpath}')
+            await loc.click(timeout=2000)
+            await loc.fill(text, timeout=2000)
+            typed = True
+        except Exception:
+            pass
+
+    # Press Enter to submit search/input
     await page.keyboard.press("Enter")
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=4000)
+    except Exception:
+        pass
     await asyncio.sleep(2)
-    
-    return {"actions_taken": [f"Typed {text} into {element_description}"]}
+
+    return {"actions_taken": [f"Typed '{text}' into {element_description} and submitted (pressed Enter). Search results should now be visible."]}
 
 # Scroll Page
 
@@ -574,9 +532,13 @@ async def scrape_pdf(page):
 # Docs from Text
 
 async def docs_from_text(data, url):
-    text_splitter = SpacyTextSplitter(chunk_size=500, chunk_overlap=10)
-    
-    texts = text_splitter.split_text(data)
+    try:
+        text_splitter = SpacyTextSplitter(chunk_size=500, chunk_overlap=10)
+        texts = text_splitter.split_text(data)
+    except Exception as e:
+        print(f"SpacyTextSplitter failed ({e}), using RecursiveCharacterTextSplitter fallback")
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        texts = text_splitter.split_text(data)
 
     docs = [Document(page_content=text, metadata={"source": url}) for text in texts]
 
@@ -586,12 +548,10 @@ async def docs_from_text(data, url):
 
 async def store_doc_embeddings(docs):
 
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
     vector_store = Chroma(
         collection_name="webpage_rag",
         embedding_function=embeddings,
-        persist_directory="./rag_store_webpage",  # Where to save data locally, remove if not necessary
+        persist_directory="./rag_store_webpage_gemini",
     )
 
     vector_store.add_documents(docs)
@@ -684,18 +644,25 @@ async def url_decide_node(state: AgentState):
         HumanMessage(content=human_message)
     ]
 
-    structured_llm = llm_mini.with_structured_output(Url)
+    structured_llm = llm_fast.with_structured_output(Url)
     response = structured_llm.invoke(messages)
     print(response)
 
     page = state["page"]
-   
+    target_url = "NO_CHANGE"
+    if response is not None:
+        if hasattr(response, "url"):
+            target_url = response.url
+        elif isinstance(response, dict):
+            target_url = response.get("url", "NO_CHANGE")
 
-    if response.url == "NO_CHANGE":
-        return {"page": page }
-    else:
-        await page.goto(response.url)
-        return { "page": page }
+    if target_url and target_url != "NO_CHANGE" and isinstance(target_url, str) and target_url.startswith("http"):
+        try:
+            await page.goto(target_url)
+        except Exception as e:
+            print(f"Error navigating to {target_url}: {e}")
+
+    return {"page": page}
     
 
 
@@ -705,7 +672,7 @@ async def annotate_page(state: AgentState):
 
     await remove_highlights(page)
 
-    if dom_elements[0]["type"] == "pdf":
+    if dom_elements and dom_elements[0].get("type") == "pdf":
         return {"dom_elements": dom_elements, "is_pdf": True}
     else:
         return {"dom_elements": dom_elements, "is_pdf": False}
@@ -854,7 +821,7 @@ async def self_review(state: AgentState):
     vector_store = Chroma(
     collection_name="webpage_rag",
     embedding_function=embeddings,
-    persist_directory="./rag_store_webpage",
+    persist_directory="./rag_store_webpage_gemini",
 )
 
     input_text = state["input"]
@@ -888,9 +855,15 @@ async def self_review(state: AgentState):
     
 
 
-    if len(relevant_docs) > 59  or response.answer == "Yes":
-        if response.answer == "Yes":
-            state["actions_taken"] = response.reasoning
+    has_enough_info = False
+    if response is not None:
+        answer_val = getattr(response, "answer", None) if hasattr(response, "answer") else (response.get("answer") if isinstance(response, dict) else None)
+        if answer_val == "Yes":
+            has_enough_info = True
+            reasoning_val = getattr(response, "reasoning", "") if hasattr(response, "reasoning") else (response.get("reasoning", "") if isinstance(response, dict) else "")
+            state["actions_taken"] = reasoning_val
+
+    if len(relevant_docs) > 59 or has_enough_info:
         return {"actions_taken" : [f"I have enough information on {input_text}. I will now proceed to write the article on {input_text}"], "collect_more_info" : False}
     else:
         return {"actions_taken" : [f"I need more information on {input_text}. I should visit more websites to gather information on {input_text}"], "collect_more_info" : True}
@@ -910,7 +883,7 @@ async def answer_node(state: AgentState):
     vector_store = Chroma(
         collection_name="webpage_rag",
         embedding_function=embeddings,
-        persist_directory="./rag_store_webpage",  # Where to save data locally, remove if not necessary
+        persist_directory="./rag_store_webpage_gemini",
     )
 
     input = state["input"]
@@ -1021,7 +994,7 @@ async def answer_node(state: AgentState):
         HumanMessage(content=human_message)
     ]
 
-    response = llm_o3_mini.invoke(messages)
+    response = llm_reasoning.invoke(messages)
 
     return {"answer": response.content, "conversation_history": [f"User : {input}"]+[f"WebRover : {response}"], "actions_taken" : [f"Research on {input} complete"]}
 
@@ -1033,7 +1006,7 @@ async def empty_rag_store(state : AgentState):
     vector_store = Chroma(
     collection_name="webpage_rag",
     embedding_function=embeddings,
-    persist_directory="./rag_store_webpage",
+    persist_directory="./rag_store_webpage_gemini",
     )
 
     try:
@@ -1093,4 +1066,3 @@ builder.add_edge("go_back", "annotate_page")
 builder.add_edge("go_to_search", "annotate_page")
 
 research_agent = builder.compile()
-

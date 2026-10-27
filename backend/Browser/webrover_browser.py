@@ -14,11 +14,7 @@ class WebRoverBrowser:
                  user_data_dir: Optional[str] = None,
                  headless: bool = False,
                  proxy: Optional[str] = None):
-        base_dir = self._default_user_dir()
-        # Initially just store the base Chrome directory
-        self.base_user_dir = base_dir
-        # Will be set after profile selection
-        self.user_data_dir = None
+        self.user_data_dir = user_data_dir or self._default_user_dir()
         self.headless = headless
         self.proxy = proxy
         self._browser: Optional[Browser] = None
@@ -26,25 +22,37 @@ class WebRoverBrowser:
         self._playwright = None
 
     def _default_user_dir(self) -> str:
-        """Get platform-specific default user data directory"""
+        """Get an isolated Chrome profile directory for WebRover."""
         system = platform.system()
         if system == "Windows":
-            return str(Path.home() / "AppData/Local/Google/Chrome/User Data")
+            return str(Path.home() / "AppData/Local/WebRover/Chrome")
         elif system == "Darwin":
-            return str(Path.home() / "Library/Application Support/Google/Chrome")
+            return str(Path.home() / "Library/Application Support/WebRover/Chrome")
         else:  # Linux
-            return str(Path.home() / ".config/google-chrome")
+            return str(Path.home() / ".config/webrover/chrome")
 
     async def connect_to_chrome(self, 
                               timeout: float = 30,
-                              retries: int = 3) -> Tuple[async_playwright, Browser, BrowserContext]:
+                              retries: int = 3) -> Tuple[Browser, BrowserContext]:
         """Connect to existing Chrome instance with retry logic"""
         self._playwright = await async_playwright().start()
         
-        print("Starting Chrome with remote debugging...")
-        chrome_process = await self.launch_chrome_with_remote_debugging()
-        
-        await asyncio.sleep(3)  # Wait for Chrome to start
+        # Check if Chrome is already running on remote debugging port 9222
+        is_running = False
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            is_running = (sock.connect_ex(('127.0.0.1', 9222)) == 0)
+            sock.close()
+        except Exception:
+            pass
+
+        if not is_running:
+            print("Starting Chrome with remote debugging...")
+            await self.launch_chrome_with_remote_debugging()
+            await asyncio.sleep(2)  # Wait for Chrome to initialize
+        else:
+            print("Chrome is already listening on port 9222, connecting directly...")
         
         print("Attempting to connect to Chrome...")
         for attempt in range(retries):
@@ -89,6 +97,18 @@ class WebRoverBrowser:
 
     async def launch_chrome_with_remote_debugging(self):
         """Launch Chrome with remote debugging port"""
+        # First check if port 9222 is already open
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            if sock.connect_ex(('127.0.0.1', 9222)) == 0:
+                sock.close()
+                print("Chrome is already listening on remote debugging port 9222")
+                return None
+            sock.close()
+        except Exception:
+            pass
+
         # First launch Chrome normally to let user select profile
         chrome_path = {
             "Windows": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
@@ -99,6 +119,7 @@ class WebRoverBrowser:
         cmd = [
             chrome_path,
             f"--remote-debugging-port=9222",
+            f"--user-data-dir={self.user_data_dir}",
             "--no-first-run",
             "--no-default-browser-check",
             "--start-maximized",
@@ -107,7 +128,9 @@ class WebRoverBrowser:
         if self.headless:
             cmd.append("--headless=new")
 
+        process = None
         try:
+            Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
             print("Launching Chrome with command:", " ".join(cmd))
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -128,12 +151,27 @@ class WebRoverBrowser:
                         return process
                 except:
                     continue
+                if process.returncode is not None:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(1.0)
+                        is_active = (sock.connect_ex(('127.0.0.1', 9222)) == 0)
+                        sock.close()
+                        if is_active:
+                            print("Chrome connected through existing session on port 9222")
+                            return None
+                    except Exception:
+                        pass
+                    stderr = await process.stderr.read()
+                    raise RuntimeError(
+                        f"Chrome exited before opening port 9222: {stderr.decode().strip()}"
+                    )
             
             raise RuntimeError("Chrome failed to start with remote debugging port")
             
         except Exception as e:
             print(f"Error launching Chrome: {e}")
-            if process:
+            if process and process.returncode is not None:
                 stderr = await process.stderr.read()
                 print(f"Chrome stderr output: {stderr.decode()}")
             raise RuntimeError(f"Failed to launch Chrome: {str(e)}")
@@ -218,4 +256,3 @@ class WebRoverBrowser:
             await self._browser.close()
         if self._playwright:
             await self._playwright.stop()
-

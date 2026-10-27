@@ -1,11 +1,6 @@
 import { useState } from 'react';
 import { CheckIcon, DocumentIcon, ArrowDownTrayIcon } from '@heroicons/react/24/outline';
-import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
-import { createRoot } from 'react-dom/client';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import { markdownComponents } from './ResponseDisplay';
 
 interface ResponseActionsProps {
   content: string;
@@ -65,35 +60,10 @@ export function ResponseActions({ content, isResearchResponse }: ResponseActions
       let y = 50;
       const margin = 50;
       const maxWidth = pageWidth - (margin * 2);
-      const lineHeight = 1.5;
       
       const splitTextToSize = (text: string, fontSize: number) => {
         pdf.setFontSize(fontSize);
         return pdf.splitTextToSize(text, maxWidth);
-      };
-
-      const processBoldText = (text: string) => {
-        const parts = text.split(/(\*\*.*?\*\*)/g);
-        let currentX = margin;
-        
-        parts.forEach(part => {
-          if (part.startsWith('**') && part.endsWith('**')) {
-            const boldText = part.replace(/\*\*/g, '');
-            pdf.setFont('helvetica', 'bold');
-            const wrappedBoldText = splitTextToSize(boldText, pdf.getFontSize());
-            wrappedBoldText.forEach((line: string, index: number) => {
-              pdf.text(line, currentX, y + (index * pdf.getFontSize() * lineHeight));
-            });
-            currentX += pdf.getTextWidth(boldText) + 2;
-          } else if (part.trim().length > 0) {
-            pdf.setFont('helvetica', 'normal');
-            const wrappedText = splitTextToSize(part, pdf.getFontSize());
-            wrappedText.forEach((line: string, index: number) => {
-              pdf.text(line, currentX, y + (index * pdf.getFontSize() * lineHeight));
-            });
-            currentX += pdf.getTextWidth(part) + 2;
-          }
-        });
       };
 
       const checkNewPage = (requiredHeight: number) => {
@@ -167,11 +137,6 @@ export function ResponseActions({ content, isResearchResponse }: ResponseActions
     } catch (error) {
       console.error('Failed to generate PDF:', error);
     }
-  };
-
-  const handleGoogleDocs = () => {
-    const encodedContent = encodeURIComponent(content);
-    window.open(`https://docs.google.com/document/create?body=${encodedContent}`, '_blank');
   };
 
   return (

@@ -1,14 +1,14 @@
-import { Button } from '../ui/Button';
-import { useRef, useState } from 'react';
+import { useRef } from 'react';
 
 interface QueryInputProps {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onStop?: () => void;
   isLoading: boolean;
 }
 
-export function QueryInput({ value, onChange, onSubmit, isLoading }: QueryInputProps) {
+export function QueryInput({ value, onChange, onSubmit, onStop, isLoading }: QueryInputProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // Auto-resize textarea height
@@ -53,24 +53,37 @@ export function QueryInput({ value, onChange, onSubmit, isLoading }: QueryInputP
                      resize-none overflow-hidden min-h-[60px] max-h-[120px]"
           />
           
-          <button
-            onClick={onSubmit}
-            disabled={isLoading || !value.trim()}
-            className="absolute right-2 top-2 px-6 py-2.5 
-                     bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500
-                     rounded-xl text-white font-medium
-                     hover:opacity-90 hover:shadow-lg hover:shadow-purple-500/25
-                     disabled:opacity-50 disabled:cursor-not-allowed
-                     transform hover:scale-[1.02] active:scale-[0.98]
-                     transition-all duration-300"
-          >
-            {isLoading ? (
-              <div className="w-5 h-5 border-2 border-white/30 border-t-white/90 
-                           rounded-full animate-spin" />
-            ) : (
-              'Send'
-            )}
-          </button>
+          {isLoading ? (
+            <button
+              onClick={onStop}
+              type="button"
+              className="absolute right-2 top-2 px-5 py-2.5 
+                       bg-gradient-to-r from-red-600 to-rose-600
+                       hover:from-red-500 hover:to-rose-500
+                       rounded-xl text-white font-medium text-sm
+                       shadow-lg shadow-red-500/25
+                       transform hover:scale-[1.02] active:scale-[0.98]
+                       transition-all duration-300 flex items-center gap-2 cursor-pointer"
+              title="Stop model execution"
+            >
+              <span className="w-2.5 h-2.5 rounded-xs bg-white animate-pulse" />
+              <span>Stop</span>
+            </button>
+          ) : (
+            <button
+              onClick={onSubmit}
+              disabled={!value.trim()}
+              className="absolute right-2 top-2 px-6 py-2.5 
+                       bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500
+                       rounded-xl text-white font-medium
+                       hover:opacity-90 hover:shadow-lg hover:shadow-purple-500/25
+                       disabled:opacity-50 disabled:cursor-not-allowed
+                       transform hover:scale-[1.02] active:scale-[0.98]
+                       transition-all duration-300"
+            >
+              Send
+            </button>
+          )}
         </div>
       </div>
     </div>

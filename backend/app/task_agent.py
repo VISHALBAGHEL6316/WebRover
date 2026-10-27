@@ -1,7 +1,4 @@
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
-import os
+from .models import llm, llm_fast, llm_reasoning
 from Browser.webrover_browser import WebRoverBrowser  
 from typing import TypedDict, List, Annotated, Literal, Optional
 from operator import add
@@ -12,6 +9,15 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 import asyncio
 import platform
+import urllib.parse
+from pathlib import Path
+
+def load_marking_script(filename: str) -> str:
+    path = Path("marking_scripts") / filename
+    if not path.exists():
+        path = Path(__file__).resolve().parent.parent / "marking_scripts" / filename
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 from IPython.display import Image, display
 from langgraph.graph import StateGraph, START, END
@@ -24,7 +30,7 @@ class MasterPlan(TypedDict):
     master_plan: List[str]
 
 class Url(BaseModel):
-    url: str | Literal["NO_CHANGE"] = Field(description="The url to navigate to")
+    url: str | Literal["NO_CHANGE"] = Field(default="NO_CHANGE", description="The url to navigate to")
 
 class DomElement(TypedDict):
     index : int
@@ -64,26 +70,6 @@ class AgentState(TypedDict):
 
 
 
-
-load_dotenv()
-def set_env_vars(var):
-    value = os.getenv(var)
-    if value is not None:
-        os.environ[var] = value
-
-
-vars = ["OPENAI_API_KEY", "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LANGCHAIN_ENDPOINT", "LANGCHAIN_PROJECT", "TAVILY_API_KEY"]
-
-for var in vars:
-    set_env_vars(var)
-
-llm_4o = ChatOpenAI(model="gpt-4o", temperature=0)
-llm_mini = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-llm_o3_mini = ChatOpenAI(model="o3-mini", reasoning_effort="high")
-
-llm_anthropic = ChatAnthropic(model="claude-3-5-sonnet-20240620", temperature=0)
-llm_openai_o1 = ChatOpenAI(model="o1-preview", temperature=1)
-llm = llm_4o
 
   
 
@@ -151,18 +137,26 @@ async def decide_url(state: AgentState):
         HumanMessage(content=human_message)
     ]
 
-    structured_llm = llm_mini.with_structured_output(Url)
+    structured_llm = llm_fast.with_structured_output(Url)
     response = structured_llm.invoke(messages)
     print(response)
 
     page = state["page"]
-   
+    target_url = "NO_CHANGE"
+    if response is not None:
+        if hasattr(response, "url"):
+            target_url = response.url
+        elif isinstance(response, dict):
+            target_url = response.get("url", "NO_CHANGE")
 
-    if response.url == "NO_CHANGE":
-        return {"page": page , "actions_taken": ["No change in the url, so I will continue with the same url"]}
-    else:
-        await page.goto(response.url)
-        return { "page": page , "actions_taken": [f"Navigated to the {response.url}"]}
+    if target_url and target_url != "NO_CHANGE" and isinstance(target_url, str) and target_url.startswith("http"):
+        try:
+            await page.goto(target_url)
+            return {"page": page, "actions_taken": [f"Navigated to {target_url}"]}
+        except Exception as e:
+            print(f"Error navigating to {target_url}: {e}")
+
+    return {"page": page, "actions_taken": ["No change in the url, so I will continue with the same url"]}
     
 
 # Master Plan Node
@@ -213,7 +207,7 @@ async def master_plan_node(state: AgentState):
         partial_variables = {"conversation_history": []},
         optional_variables= ["conversation_history"]
     )
-    structured_llm = llm_mini.with_structured_output(MasterPlan)
+    structured_llm = llm_fast.with_structured_output(MasterPlan)
 
     formatted_prompt = prompt.invoke({"input": input, "conversation_history": conversation_history})
 
@@ -237,8 +231,7 @@ async def scrape_text(page):
 
 
 # Load the JavaScript file
-with open("marking_scripts/marking.js", "r", encoding="utf-8") as f:
-    marking_script_all = f.read()
+marking_script_all = load_marking_script("marking.js")
 
 async def execute_script_all(page):
 
@@ -314,8 +307,7 @@ async def get_all_elements(state: AgentState):
 # Annotate links node
 
 # Load the JavaScript file
-with open("marking_scripts/marking_links.js", "r", encoding="utf-8") as f:
-    marking_scrip_links = f.read()
+marking_scrip_links = load_marking_script("marking_links.js")
 
 async def execute_script_links(page):
 
@@ -393,8 +385,7 @@ async def get_all_link_elements(state: AgentState):
 
 
 # Load the JavaScript file
-with open("marking_scripts/marking_input.js", "r", encoding="utf-8") as f:
-    marking_script_input = f.read()
+marking_script_input = load_marking_script("marking_input.js")
 
 async def execute_script_input(page):
 
@@ -471,8 +462,7 @@ async def get_all_input_elements(state: AgentState):
 # Annotate Button Elements Node
 
 # Load the JavaScript file
-with open("marking_scripts/marking_buttons_2.js", "r", encoding="utf-8") as f:
-    marking_script_buttons = f.read()
+marking_script_buttons = load_marking_script("marking_buttons_2.js")
 
 async def execute_script_buttons(page):
 
@@ -758,144 +748,71 @@ async def interact_with_link_elements(state: AgentState):
 async def type(state: AgentState):
     """Types text into input fields."""
     page = state["page"]
-    input_action = state["actions"]["element_actions"]
+    input_action = state["actions"].get("element_actions") or {}
     old_page = page.url
     input_actions_taken = []
 
-    inViewport = input_action["action_element"]["inViewport"]
-    if inViewport == False:
-        # First attempt: Smooth scroll into view
+    action_element = input_action.get("action_element") or {}
+    xpath = action_element.get("xpath")
+    bbox_x = action_element.get("x")
+    bbox_y = action_element.get("y")
+    inViewport = action_element.get("inViewport", True)
+    text = input_action.get("args", "")
+
+    # Scroll into view if needed
+    if inViewport is False and xpath:
         try:
-            await page.evaluate(
-                """
-                (xpath) => {
-                    const result = document.evaluate(
-                        xpath, 
-                        document, 
-                        null, 
-                        XPathResult.FIRST_ORDERED_NODE_TYPE, 
-                        null
-                    );
-                    const element = result.singleNodeValue;
-                    if (element) {
-                        element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
-                        return true;
-                    }
-                    return false;
-                }
-                """,
-                xpath
-            )
-            await asyncio.sleep(1)  # Allow smooth scroll to complete
+            await page.locator(f'xpath={xpath}').scroll_into_view_if_needed(timeout=1500)
         except Exception:
-            # If smooth scroll fails, try instant scroll
             try:
-                await page.evaluate(
-                    """
-                    (x, y) => {
-                        window.scrollTo({
-                            top: y - (window.innerHeight / 2),
-                            behavior: 'instant'
-                        });
-                    }
-                    """,
-                    bbox_x, bbox_y
-                )
-                await asyncio.sleep(0.5)
+                if bbox_x is not None and bbox_y is not None:
+                    await page.evaluate("(x, y) => window.scrollTo({ top: y - (window.innerHeight / 2), behavior: 'smooth' })", bbox_x, bbox_y)
             except Exception:
-                return {"actions_taken": [f"Failed to scroll to element: {str(e)}"]}
+                pass
 
-
-    text = input_action["args"]
-    print("Text to type: ", text)
-
-    
-    try:
-        print("Using XPath")
-        xpath = input_action["action_element"]["xpath"]
-        element = page.locator(f'xpath={xpath}')
-        print("Element: ", element)
-        await asyncio.sleep(2)
-        await element.click()
-        print("Clicked")
-        await asyncio.sleep(2)
-        if platform.system() == "Darwin":
-            await element.press("Meta+A")
-        else:
-            await element.press("Control+A")
-        print("Selected")
-        await element.press("Backspace")
-        print("Backspace")
-        await asyncio.sleep(2)
-        await element.type(input_action["args"])
-        print("Typed")
-        await asyncio.sleep(2)
-        await element.press("Enter")
-        print("Enter")
-        await asyncio.sleep(2)
-        
-        
-
-    except Exception as e:
+    typed = False
+    # Try typing with XPath locator
+    if xpath:
         try:
-            # Fallback to coordinates
-            print("Using Bounding Box")
-            bbox_x = input_action["action_element"]["x"]
-            bbox_y = input_action["action_element"]["y"]
-            print("Bounding Box: ", bbox_x, bbox_y)
-            
+            loc = page.locator(f'xpath={xpath}')
+            await loc.click(timeout=2000)
+            select_all = "Meta+A" if platform.system() == "Darwin" else "Control+A"
+            await loc.press(select_all)
+            await loc.press("Backspace")
+            await loc.fill(text, timeout=2000)
+            await page.keyboard.press("Enter")
+            typed = True
+        except Exception:
+            pass
+
+    # Fallback to mouse / keyboard coordinates
+    if not typed and bbox_x is not None and bbox_y is not None and bbox_x > 0 and bbox_y > 0:
+        try:
             await page.mouse.click(bbox_x, bbox_y)
-            await asyncio.sleep(2)
-            
+            await asyncio.sleep(0.5)
             select_all = "Meta+A" if platform.system() == "Darwin" else "Control+A"
             await page.keyboard.press(select_all)
-            await asyncio.sleep(2)
             await page.keyboard.press("Backspace")
-
-                
-            await asyncio.sleep(2)
-
-            await page.mouse.click(bbox_x, bbox_y)
-            
-         
-            await asyncio.sleep(2)
-            await page.keyboard.type(input_action["args"])
-            print("Typed")
-            await asyncio.sleep(2)
+            await page.keyboard.type(text)
             await page.keyboard.press("Enter")
-            print("Enter")
-            await asyncio.sleep(2)
-            
-            
+            typed = True
         except Exception as e:
             input_actions_taken.append(f"Failed to type {text}")
-            
-        
-    
-    element_description = (
-        f"{'input' if 'input' in input_action['action_element']['type'] else 'text area'} "
-        f"element {input_action['action_element']['description']}"
-    )
 
-    await asyncio.sleep(5)
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=4000)
+    except Exception:
+        pass
+    await asyncio.sleep(2)
 
-    action_type = input_action["action_type"] if input_action else None
+    element_description = f"{'input' if 'input' in action_element.get('type', '') else 'text area'} element {action_element.get('description', '')}"
 
-    print("Action Type: ", action_type)
-
-    
+    action_type = input_action.get("action_type")
     if action_type == "type_in_text_editor":
         return {"actions_taken": ["I have successfully typed the entire report into the text editor"]}
     else:
-        if old_page == page.url:
-            print("Old Page: ", old_page)
-            print("Actions Taken: ", [f"Typed {text} into {element_description}"])
-            return {"actions_taken":[f"Typed {text} into {element_description}"], "new_page": False}
-        else:
-            print("Old Page: ", old_page)
-            print("Actions Taken: ", [f"Typed {text} into {element_description}"])
-            return {"actions_taken": [f"Typed {text} into {element_description}"], "new_page": True}
-        
+        new_page = (old_page != page.url)
+        return {"actions_taken": [f"Typed '{text}' into {element_description} and submitted (pressed Enter)."], "new_page": new_page}
 
 
 
@@ -904,184 +821,103 @@ async def type(state: AgentState):
 
 async def click(state: AgentState):
     """Handles clicking elements with improved error handling and retry logic."""
-    
     click_actions_taken = []
     page = state["page"]
     old_page = page.url
-    click_action = state["actions"]["element_actions"]
+    click_action = state["actions"].get("element_actions") or {}
 
-    element_type = click_action["action_element"]["type"]
-      
-    xpath = click_action["action_element"]["xpath"]
-    bbox_x = click_action["action_element"]["x"]
-    bbox_y = click_action["action_element"]["y"]
-    inViewport = click_action["action_element"]["inViewport"]
+    action_element = click_action.get("action_element") or {}
+    element_type = action_element.get("type", "")
+    xpath = action_element.get("xpath")
+    bbox_x = action_element.get("x")
+    bbox_y = action_element.get("y")
+    inViewport = action_element.get("inViewport", True)
+    element_description = f"{action_element.get('text', '')} {action_element.get('type', '')}".strip() or "element"
 
-    if inViewport == False:
-        # First attempt: Smooth scroll into view
+    if inViewport is False and xpath:
         try:
-            await page.evaluate(
-                """
-                (xpath) => {
-                    const result = document.evaluate(
-                        xpath, 
-                        document, 
-                        null, 
-                        XPathResult.FIRST_ORDERED_NODE_TYPE, 
-                        null
-                    );
-                    const element = result.singleNodeValue;
-                    if (element) {
-                        element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
-                        return true;
-                    }
-                    return false;
-                }
-                """,
-                xpath
-            )
-            await asyncio.sleep(1)  # Allow smooth scroll to complete
+            await page.locator(f'xpath={xpath}').scroll_into_view_if_needed(timeout=1500)
         except Exception:
-            # If smooth scroll fails, try instant scroll
-            try:
-                await page.evaluate(
-                    """
-                    (x, y) => {
-                        window.scrollTo({
-                            top: y - (window.innerHeight / 2),
-                            behavior: 'instant'
-                        });
-                    }
-                    """,
-                    bbox_x, bbox_y
-                )
-                await asyncio.sleep(0.5)
-            except Exception:
-                return {"actions_taken": [f"Failed to scroll to element: {str(e)}"]}
+            pass
 
-    
-    success = False
-    attempts = 0
-    max_attempts = 3
+    clicked = False
+    new_page_created = False
 
-    while not success and attempts < max_attempts:
-        attempts += 1
+    # 1. If it's a link, resolve its href and navigate/open tab directly
+    if ("link" in element_type) and xpath:
         try:
+            loc = page.locator(f'xpath={xpath}')
+            href = await loc.get_attribute("href", timeout=2000)
+            if href:
+                full_url = urllib.parse.urljoin(page.url, href)
+                if full_url.startswith("http"):
+                    try:
+                        new_page = await page.context.new_page()
+                        await new_page.goto(full_url, timeout=30000, wait_until="domcontentloaded")
+                        state["page"] = new_page
+                        new_page_created = True
+                        clicked = True
+                    except Exception as e:
+                        print(f"Error opening new tab for {full_url}: {e}")
+        except Exception:
+            pass
+
+    # 2. Try standard Playwright locator click
+    if not clicked and xpath:
+        try:
+            loc = page.locator(f'xpath={xpath}')
             if "link" in element_type:
-                # Handle links with existing logic
-                async with page.context.expect_page(timeout=10000) as new_page_info:
-                    if platform.system() == "Darwin":
-                        await page.locator(f'xpath={xpath}').click(
-                            modifiers=["Meta"],
-                            timeout=5000,
-                            force=attempts == max_attempts  # Force click on last attempt
-                        )
-                    else:
-                        await page.locator(f'xpath={xpath}').click(
-                            modifiers=["Control"],
-                            timeout=5000,
-                            force=attempts == max_attempts
-                        )
-                    
-                    new_page = await new_page_info.value
-                    await asyncio.sleep(3)
-                    await new_page.bring_to_front()
-                    state["page"] = new_page
-                    success = True
-            else:
-                # Enhanced button/element clicking
                 try:
-                    # Try precise click first
-                    await page.locator(f'xpath={xpath}').click(
-                        timeout=5000,
-                        delay=100,  # Add slight delay for stability
-                        force=attempts == max_attempts
-                    )
-                    success = True
-                except Exception as e:
-                    # If precise click fails, try coordinate click
-                    if attempts == max_attempts - 1:
-                        # On penultimate attempt, try clicking with JavaScript
-                        await page.evaluate(
-                            """
-                            (xpath) => {
-                                const element = document.evaluate(
-                                    xpath,
-                                    document,
-                                    null,
-                                    XPathResult.FIRST_ORDERED_NODE_TYPE,
-                                    null
-                                ).singleNodeValue;
-                                if (element) {
-                                    element.click();
-                                    return true;
-                                }
-                                return false;
-                            }
-                            """,
-                            xpath
-                        )
-                        await asyncio.sleep(1)
-                    else:
-                        # Try coordinate-based click
-                        await page.mouse.click(
-                            bbox_x,
-                            bbox_y,
-                            delay=100,
-                            force=attempts == max_attempts
-                        )
-                    
-                    # Wait briefly to check if click had an effect
-                    await asyncio.sleep(1)
-                    
-                    # Check if page changed or any visible effect occurred
-                    if page.url != old_page:
-                        success = True
-                    else:
-                        # Additional check for button effect (e.g., style changes)
-                        changed = await page.evaluate(
-                            """
-                            (xpath) => {
-                                const element = document.evaluate(
-                                    xpath,
-                                    document,
-                                    null,
-                                    XPathResult.FIRST_ORDERED_NODE_TYPE,
-                                    null
-                                ).singleNodeValue;
-                                return element && (
-                                    element.matches(':active') ||
-                                    element.matches(':focus') ||
-                                    element.getAttribute('aria-expanded') === 'true'
-                                );
-                            }
-                            """,
-                            xpath
-                        )
-                        if changed:
-                            success = True
+                    async with page.context.expect_page(timeout=3000) as new_page_info:
+                        if platform.system() == "Darwin":
+                            await loc.click(modifiers=["Meta"], timeout=2500)
+                        else:
+                            await loc.click(modifiers=["Control"], timeout=2500)
+                    new_page = await new_page_info.value
+                    if new_page:
+                        await new_page.bring_to_front()
+                        await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        state["page"] = new_page
+                        new_page_created = True
+                        clicked = True
+                except Exception:
+                    await loc.click(timeout=3000)
+                    clicked = True
+            else:
+                await loc.click(timeout=3000)
+                clicked = True
+        except Exception:
+            try:
+                await page.locator(f'xpath={xpath}').click(force=True, timeout=2000)
+                clicked = True
+            except Exception:
+                try:
+                    await page.evaluate("""(xpath) => {
+                        const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        if (el) { el.click(); return true; }
+                        return false;
+                    }""", xpath)
+                    clicked = True
+                except Exception:
+                    pass
 
+    # 3. Fallback to coordinate-based clicking
+    if not clicked and bbox_x is not None and bbox_y is not None and bbox_x > 0 and bbox_y > 0:
+        try:
+            await page.mouse.click(bbox_x, bbox_y)
+            clicked = True
         except Exception as e:
-            if attempts == max_attempts:
-                click_actions_taken.append(f"Failed to click {element_type} after {max_attempts} attempts")
-                continue
-            await asyncio.sleep(1)  # Brief pause before retry
+            print(f"Coordinate click failed: {e}")
 
-        element_description = (
-            f"{click_action['action_element']['text']} {click_action['action_element']['type']}"
-        )
-        if success:
-            click_actions_taken.append(f"Successfully clicked {element_description}")
-        
-        # Check if we need to break the loop (page changed)
-        if page.url != old_page:
-            break
+    await asyncio.sleep(2)
 
-    # Return appropriate status
-    if old_page == state["page"].url:
-        return {"actions_taken": click_actions_taken, "new_page": False}
+    is_new = new_page_created or (old_page != state["page"].url)
+    if clicked:
+        click_actions_taken.append(f"Successfully clicked {element_description}")
     else:
-        return {"actions_taken": click_actions_taken, "new_page": True}
+        click_actions_taken.append(f"Attempted to click {element_description}, continuing")
+
+    return {"actions_taken": click_actions_taken, "new_page": is_new, "page": state["page"]}
     
 
 
@@ -1270,4 +1106,3 @@ builder.add_edge("click","decide_immediate_action")
 
 
 task_agent = builder.compile()
-

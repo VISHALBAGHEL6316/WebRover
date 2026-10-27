@@ -11,6 +11,7 @@ export function ParticlesBackground() {
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    const context = ctx;
 
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
@@ -36,21 +37,21 @@ export function ParticlesBackground() {
     }
 
     function animate() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      context.clearRect(0, 0, context.canvas.width, context.canvas.height);
       
       particles.forEach(particle => {
         particle.x += particle.speedX;
         particle.y += particle.speedY;
         
-        if (particle.x > canvas.width) particle.x = 0;
-        if (particle.x < 0) particle.x = canvas.width;
-        if (particle.y > canvas.height) particle.y = 0;
-        if (particle.y < 0) particle.y = canvas.height;
+        if (particle.x > context.canvas.width) particle.x = 0;
+        if (particle.x < 0) particle.x = context.canvas.width;
+        if (particle.y > context.canvas.height) particle.y = 0;
+        if (particle.y < 0) particle.y = context.canvas.height;
 
-        ctx.beginPath();
-        ctx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(147, 197, 253, ${particle.opacity})`;
-        ctx.fill();
+        context.beginPath();
+        context.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+        context.fillStyle = `rgba(147, 197, 253, ${particle.opacity})`;
+        context.fill();
       });
 
       requestAnimationFrame(animate);

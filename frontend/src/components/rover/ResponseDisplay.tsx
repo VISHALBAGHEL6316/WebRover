@@ -1,10 +1,9 @@
-import { SpotlightCard } from '@/components/ui/SpotlightCard';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/cjs/styles/prism';
 import remarkGfm from 'remark-gfm';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useEffect, useState, useMemo, useRef, ReactNode } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import type { Components } from 'react-markdown';
 import { ResponseActions } from './ResponseActions';
 
@@ -20,33 +19,8 @@ interface ResponseDisplayProps {
   messages: Message[];
 }
 
-function useTemporaryMessages(messages: Message[]) {
-  const [visibleMessages, setVisibleMessages] = useState<Message[]>([]);
-
-  useEffect(() => {
-    const finalMessage = messages.find(m => 
-      m.type === 'final_answer' || m.type === 'final_response'
-    );
-
-    if (finalMessage) {
-      setVisibleMessages([]);
-      return;
-    }
-
-    const streamingMessages = messages.filter(m => 
-      m.type !== 'final_answer' && 
-      m.type !== 'final_response' && 
-      m.type !== 'user_input'
-    );
-    
-    setVisibleMessages(streamingMessages);
-  }, [messages]);
-
-  return visibleMessages;
-}
-
 // Helper function to stringify message content
-const formatMessageContent = (content: any) => {
+const formatMessageContent = (content: unknown) => {
   if (Array.isArray(content)) {
     return content.join('\n');
   }
@@ -64,73 +38,63 @@ const formatMessageContent = (content: any) => {
     }
   }
   
-  return String(content);
+  return String(content ?? '');
 };
 
-interface MarkdownComponentProps {
-  children?: ReactNode;
-  className?: string;
-  inline?: boolean;
-  href?: string;
-  language?: string;
-  node?: any;
-  [key: string]: any;
-}
-
 export const markdownComponents: Components = {
-  h1: ({ children, ...props }: MarkdownComponentProps) => (
+  h1: ({ children, ...props }) => (
     <h1 className="text-3xl font-bold mt-8 mb-6 bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400 
                    text-transparent bg-clip-text" {...props}>
       {children}
     </h1>
   ),
-  h2: ({ children, ...props }: MarkdownComponentProps) => (
+  h2: ({ children, ...props }) => (
     <h2 className="text-2xl font-semibold mt-6 mb-4 text-indigo-300 
                    border-b border-indigo-500/20 pb-2" {...props}>
       {children}
     </h2>
   ),
-  h3: ({ children, ...props }: MarkdownComponentProps) => (
+  h3: ({ children, ...props }) => (
     <h3 className="text-xl font-medium mt-4 mb-3 text-purple-300" {...props}>
       {children}
     </h3>
   ),
-  p: ({ children, ...props }: MarkdownComponentProps) => (
+  p: ({ children, ...props }) => (
     <p className="text-zinc-100 leading-7 mb-4" {...props}>
       {children}
     </p>
   ),
-  ul: ({ children, ...props }: MarkdownComponentProps) => (
+  ul: ({ children, ...props }) => (
     <ul className="my-4 space-y-2 list-none" {...props}>
       {children}
     </ul>
   ),
-  ol: ({ children, ...props }: MarkdownComponentProps) => (
+  ol: ({ children, ...props }) => (
     <ol className="my-4 space-y-2 list-decimal pl-4" {...props}>
       {children}
     </ol>
   ),
-  li: ({ children, ...props }: MarkdownComponentProps) => (
+  li: ({ children, ...props }) => (
     <li className="flex items-start" {...props}>
       <span className="text-indigo-400 mr-2 font-bold">•</span>
       <span className="text-zinc-100">{children}</span>
     </li>
   ),
-  blockquote: ({ children, ...props }: MarkdownComponentProps) => (
+  blockquote: ({ children, ...props }) => (
     <blockquote className="border-l-4 border-indigo-500/50 bg-indigo-500/5 
                           pl-6 py-4 my-6 rounded-r-lg italic text-zinc-300" {...props}>
       {children}
     </blockquote>
   ),
-  code: ({ inline, className, children, ...props }: MarkdownComponentProps) => {
-    const match = /language-(\w+)/.exec(className || '');
-    return !inline && match ? (
+  code: ({ className, children, ...props }) => {
+    const isInline = 'inline' in props ? Boolean(props.inline) : false;
+    const match = /language-(\w+)/.exec(String(className || ''));
+    return !isInline && match ? (
       <SyntaxHighlighter
         style={oneDark}
         language={match[1]}
         PreTag="div"
         className="!my-8 rounded-xl border border-white/10 !bg-zinc-900/50 !p-6"
-        {...props}
       >
         {String(children).replace(/\n$/, '')}
       </SyntaxHighlighter>
@@ -140,24 +104,24 @@ export const markdownComponents: Components = {
       </code>
     );
   },
-  table: ({ children }: MarkdownComponentProps) => (
+  table: ({ children, ...props }) => (
     <div className="overflow-x-auto my-6">
-      <table className="w-full border-collapse">
+      <table className="w-full border-collapse" {...props}>
         {children}
       </table>
     </div>
   ),
-  th: ({ children }: MarkdownComponentProps) => (
-    <th className="text-left py-2 px-4 border-b border-zinc-800 text-indigo-300 font-semibold">
+  th: ({ children, ...props }) => (
+    <th className="text-left py-2 px-4 border-b border-zinc-800 text-indigo-300 font-semibold" {...props}>
       {children}
     </th>
   ),
-  td: ({ children }: MarkdownComponentProps) => (
-    <td className="py-2 px-4 border-b border-zinc-800/50 text-zinc-100">
+  td: ({ children, ...props }) => (
+    <td className="py-2 px-4 border-b border-zinc-800/50 text-zinc-100" {...props}>
       {children}
     </td>
   ),
-  a: ({ children, href, ...props }: MarkdownComponentProps) => (
+  a: ({ children, href, ...props }) => (
     <a 
       href={href}
       target="_blank"
@@ -284,9 +248,11 @@ export function ResponseDisplay({ messages }: ResponseDisplayProps) {
                     >
                       <div className={`max-w-[90%] md:max-w-[75%] break-words backdrop-blur-sm border 
                         px-4 py-2 rounded-xl rounded-tl-sm
-                        ${message.type.includes('action') 
-                          ? 'bg-emerald-500/10 border-emerald-500/30 shadow-emerald-500/20' 
-                          : 'bg-zinc-500/10 border-zinc-500/30 shadow-zinc-500/20'} 
+                        ${message.type === 'error'
+                          ? 'bg-rose-500/10 border-rose-500/30 shadow-rose-500/20 text-rose-300'
+                          : message.type.includes('action') 
+                            ? 'bg-emerald-500/10 border-emerald-500/30 shadow-emerald-500/20' 
+                            : 'bg-zinc-500/10 border-zinc-500/30 shadow-zinc-500/20'} 
                         shadow-lg`}>
                         <p className="text-sm text-white/70 whitespace-pre-wrap">
                           {formatMessageContent(message.content)}

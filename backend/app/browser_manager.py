@@ -2,13 +2,13 @@ from Browser.webrover_browser import WebRoverBrowser
 from typing import Dict, Any, Tuple
 from playwright.async_api import Page, Browser
 
-async def setup_browser(go_to_page: str) -> Tuple[Browser, Page]:
+async def setup_browser(go_to_page: str) -> Tuple[WebRoverBrowser, Page]:
     """
     Sets up a browser instance and returns the browser and page objects.
     """
     print(f"Setting up browser for {go_to_page}")
-    browser = WebRoverBrowser()
-    browser, context = await browser.connect_to_chrome()
+    rover_browser = WebRoverBrowser()
+    _, context = await rover_browser.connect_to_chrome()
 
     page = await context.new_page()
     
@@ -19,7 +19,7 @@ async def setup_browser(go_to_page: str) -> Tuple[Browser, Page]:
         # Fallback to Google if the original page fails to load
         await page.goto("https://www.google.com", timeout=100000, wait_until="domcontentloaded")
 
-    return browser, page
+    return rover_browser, page
 
 async def cleanup_browser_session(browser: WebRoverBrowser) -> None:
     """
